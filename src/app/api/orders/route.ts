@@ -3,7 +3,17 @@ import { cookies } from "next/headers";
 import prisma from "@/lib/prisma";
 import { verifySession } from "@/lib/auth";
 
-async function getUserId() {
+type CartItem = {
+  quantity: number;
+  product: {
+    id: number;
+    name: string;
+    price: number;
+    stock: number;
+  };
+};
+
+async function getUserId(): Promise<number | null> {
   const cookieStore = await cookies();
 
   const token = cookieStore.get("velora_session")?.value;
@@ -25,6 +35,9 @@ async function getUserId() {
 // Create a new order from the user's cart
 export async function POST(request: Request) {
   try {
+    // -----------------------------------------
+    // 1. Get logged-in user
+    // -----------------------------------------
     const userId = await getUserId();
 
     if (!userId) {
@@ -36,6 +49,9 @@ export async function POST(request: Request) {
       );
     }
 
+    // -----------------------------------------
+    // 2. Read request body
+    // -----------------------------------------
     const body = await request.json();
 
     const {
@@ -49,7 +65,9 @@ export async function POST(request: Request) {
       paymentMethod,
     } = body;
 
-    // Validate shipping information
+    // -----------------------------------------
+    // 3. Validate shipping information
+    // -----------------------------------------
     if (
       !fullName ||
       !email ||
@@ -67,7 +85,9 @@ export async function POST(request: Request) {
       );
     }
 
-    // Validate payment method
+    // -----------------------------------------
+    // 4. Validate payment method
+    // -----------------------------------------
     if (paymentMethod !== "COD") {
       return NextResponse.json(
         {
@@ -77,7 +97,9 @@ export async function POST(request: Request) {
       );
     }
 
-    // Find user's cart
+    // -----------------------------------------
+    // 5. Find user's cart
+    // -----------------------------------------
     const cart = await prisma.cart.findUnique({
       where: {
         userId,
@@ -100,8 +122,15 @@ export async function POST(request: Request) {
       );
     }
 
-    // Check stock
-    for (const item of cart.items) {
+    // -----------------------------------------
+    // 6. Treat cart items as typed data
+    // -----------------------------------------
+    const cartItems = cart.items as unknown as CartItem[];
+
+    // -----------------------------------------
+    // 7. Check product stock
+    // -----------------------------------------
+    for (const item of cartItems) {
       if (item.quantity > item.product.stock) {
         return NextResponse.json(
           {
@@ -112,103 +141,107 @@ export async function POST(request: Request) {
       }
     }
 
-    // Type used for cart items
-    type CartItem = {
-      quantity: number;
-      product: {
-        id: number;
-        name: string;
-        price: number;
-        stock: number;
-      };
-    };
-
-    // Calculate total
-    const totalAmount = cart.items.reduce(
+    // -----------------------------------------
+    // 8. Calculate total amount
+    // -----------------------------------------
+    const totalAmount = cartItems.reduce(
       (total: number, item: CartItem) =>
         total + item.product.price * item.quantity,
       0
     );
 
-    // Create order
-    const order = await prisma.$transaction(
-      async (transaction) => {
-        const newOrder = await transaction.order.create({
-          data: {
-            userId,
+    // -----------------------------------------
+    // 9. Prepare order items
+    // -----------------------------------------
+    const orderItems = cartItems.map((item: CartItem) => ({
+      productId: item.product.id,
+      productName: item.product.name,
+      price: Math.round(item.product.price),
+      quantity: item.quantity,
+    }));
 
-            totalAmount: Math.round(totalAmount),
+    // -----------------------------------------
+    // 10. Build transaction operations
+    // -----------------------------------------
+    const transactionOperations = [
+      // Create order
+      prisma.order.create({
+        data: {
+          userId,
 
-            status: "PENDING",
+          totalAmount: Math.round(totalAmount),
 
-            fullName,
-            email,
-            phone,
-            address,
-            city,
-            state,
-            pincode,
+          status: "PENDING",
 
-            // Save payment method
-            paymentMethod,
+          fullName,
+          email,
+          phone,
+          address,
+          city,
+          state,
+          pincode,
 
-            items: {
-              create: cart.items.map(
-                (item: CartItem) => ({
-                  productId: item.product.id,
+          paymentMethod,
 
-                  productName: item.product.name,
-
-                  price: Math.round(item.product.price),
-
-                  quantity: item.quantity,
-                })
-              ),
-            },
+          items: {
+            create: orderItems,
           },
-          include: {
-            items: true,
+        },
+      }),
+
+      // Remove all cart items after order creation
+      prisma.cart.update({
+        where: {
+          id: cart.id,
+        },
+        data: {
+          items: {
+            deleteMany: {},
           },
-        });
+        },
+      }),
 
-        // Update product stock
-        for (const item of cart.items) {
-          await transaction.product.update({
-            where: {
-              id: item.product.id,
-            },
-            data: {
-              stock: {
-                decrement: item.quantity,
-              },
-            },
-          });
-        }
-
-        // Clear cart after successful order
-        await transaction.cartItem.deleteMany({
+      // Update stock for every purchased product
+      ...cartItems.map((item: CartItem) =>
+        prisma.product.update({
           where: {
-            cartId: cart.id,
+            id: item.product.id,
           },
-        });
+          data: {
+            stock: {
+              decrement: item.quantity,
+            },
+          },
+        })
+      ),
+    ];
 
-        return newOrder;
-      }
+    // -----------------------------------------
+    // 11. Execute everything atomically
+    // -----------------------------------------
+    const [newOrder] = await prisma.$transaction(
+      transactionOperations
     );
 
+    // -----------------------------------------
+    // 12. Return successful response
+    // -----------------------------------------
     return NextResponse.json(
       {
         message: "Order placed successfully.",
-        order,
+        order: newOrder,
       },
       { status: 201 }
     );
   } catch (error) {
+    // -----------------------------------------
+    // 13. Handle unexpected errors
+    // -----------------------------------------
     console.error("Create order error:", error);
 
     return NextResponse.json(
       {
-        message: "Failed to place order.",
+        message: "Something went wrong while placing your order.",
       },
       { status: 500 }
     );

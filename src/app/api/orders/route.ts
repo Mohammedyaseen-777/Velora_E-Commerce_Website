@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import prisma from "@/lib/prisma";
+import { Prisma } from "@prisma/client";
 import { verifySession } from "@/lib/auth";
 
 async function getUserId() {
@@ -82,8 +83,18 @@ export async function POST(request: Request) {
     }
 
     // Find user's cart
-    const cart =
-      await prisma.cart.findUnique({
+    type CartWithItems = Prisma.CartGetPayload<{
+  include: {
+    items: {
+      include: {
+        product: true;
+      };
+    };
+  };
+}>;
+
+const cart: CartWithItems | null =
+  await prisma.cart.findUnique({
         where: {
           userId,
         },
@@ -133,7 +144,7 @@ export async function POST(request: Request) {
     // Create order
     const order =
       await prisma.$transaction(
-        async (transaction) => {
+        async (transaction: Prisma.TransactionClient) => {
           const newOrder =
             await transaction.order.create(
               {
